@@ -383,12 +383,13 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                     cuda_cmds.append(cuda_cmd)
 
                     linkopts.append(quote(cu_out))
-                    linkopts.append(
-                        f'cudart_static.lib nvrtc_static.lib nvrtc-builtins_static.lib nvptxcompiler_static.lib ws2_32.lib user32.lib /LIBPATH:"{cuda_home}/lib/x64"'
-                    )
 
-                    if args.libmathdx_path:
-                        linkopts.append(f'nvJitLink_static.lib /LIBPATH:"{args.libmathdx_path}/lib/x64" mathdx_static.lib')                
+                linkopts.append(
+                    f'cudart_static.lib nvrtc_static.lib nvrtc-builtins_static.lib nvptxcompiler_static.lib ws2_32.lib user32.lib /LIBPATH:"{cuda_home}/lib/x64"'
+                )
+
+                if args.libmathdx_path:
+                    linkopts.append(f'nvJitLink_static.lib /LIBPATH:"{args.libmathdx_path}/lib/x64" mathdx_static.lib')                
 
                 with ScopedTimer("build_cuda", active=args.verbose):        
                     if args.multi_process <= 1:
@@ -446,7 +447,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                 for cpp_path in cpp_paths:
                     cpp_out = cpp_path + ".o"
                     ld_inputs.append(quote(cpp_out))
-                    build_cmd = f'{cpp_compiler} {cpp_flags} -c "{cpp_path}" -o "{cpp_out}"'
+                    cpp_cmd = f'{cpp_compiler} {cpp_flags} -c "{cpp_path}" -o "{cpp_out}"'
                     cpp_cmds.append(cpp_cmd)
                 
                 if args.multi_process <= 1:
@@ -472,15 +473,16 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                         elif mode == "release":
                             cuda_cmd = f'clang++ -Werror -Wuninitialized -Wno-unknown-cuda-version {" ".join(clang_opts)} -O3 -fPIC -fvisibility=hidden -DNDEBUG -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
                         
-                        cuda_cmds.append(cuda_cmd)
+                    cuda_cmds.append(cuda_cmd)
 
-                        ld_inputs.append(quote(cu_out))
-                        ld_inputs.append(
-                            f'-L"{cuda_home}/lib64" -lcudart_static -lnvrtc_static -lnvrtc-builtins_static -lnvptxcompiler_static -lpthread -ldl -lrt'
-                        )
+                    ld_inputs.append(quote(cu_out))
 
-                        if args.libmathdx_path:
-                            ld_inputs.append(f"-lnvJitLink_static -L{args.libmathdx_path}/lib -lmathdx_static")
+                ld_inputs.append(
+                    f'-L"{cuda_home}/lib64" -lcudart_static -lnvrtc_static -lnvrtc-builtins_static -lnvptxcompiler_static -lpthread -ldl -lrt'
+                )
+
+                if args.libmathdx_path:
+                    ld_inputs.append(f"-lnvJitLink_static -L{args.libmathdx_path}/lib -lmathdx_static")
     
                 with ScopedTimer("build_cuda", active=args.verbose):
                     if args.multi_process <= 1:
