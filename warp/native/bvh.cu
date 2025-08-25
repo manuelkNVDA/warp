@@ -227,7 +227,7 @@ __global__ void compute_key_deltas(const int* __restrict__ keys, int* __restrict
         int b = keys[index+1];
 
         int x = a^b;
-        
+
         deltas[index] = x;// __clz(x);
     }
 }
@@ -487,9 +487,247 @@ LinearBVHBuilderGPU::~LinearBVHBuilderGPU()
 }
 
 
+static void print_verts(FILE* f, BVHPackedNodeHalf const& lower, BVHPackedNodeHalf const& upper) 
+{
+    auto getCorner = [&lower, &upper](int corner) -> vec3 {
+        bool bits[3] = { (corner & 1)!=0, (corner & 2) != 0, (corner & 4) != 0 };      
+        return { bits[0] ? lower.x : upper.x, bits[1] ? lower.y : upper.y, bits[2] ? lower.z : upper.z };
+    };
+
+    for( uint8_t i = 0; i < 8; ++i )
+    {
+        vec3 corner = getCorner(i);
+        fprintf( f, "v %f %f %f\n", corner[0], corner[1], corner[2] );
+    }
+}
+
+static void print_face( FILE* f, uint32_t ofs ) 
+{
+    fprintf( f, "f %d %d %d %d\n", ofs+1, ofs+5, ofs+6, ofs+2 );
+    fprintf( f, "f %d %d %d %d\n", ofs+3, ofs+7, ofs+8, ofs+4 );
+    fprintf( f, "f %d %d %d %d\n", ofs+1, ofs+3, ofs+7, ofs+5 );
+    fprintf( f, "f %d %d %d %d\n", ofs+5, ofs+7, ofs+8, ofs+6 );
+    fprintf( f, "f %d %d %d %d\n", ofs+6, ofs+8, ofs+4, ofs+2 );
+    fprintf( f, "f %d %d %d %d\n", ofs+2, ofs+4, ofs+3, ofs+1 );
+};
+
+static void debug(BVH const& bvh)
+{
+    wp_cuda_context_synchronize(WP_CURRENT_CONTEXT);
+
+    int root = -1;
+    wp_memcpy_d2h(WP_CURRENT_CONTEXT, &root, bvh.root, sizeof(int));
+
+    wp_cuda_context_synchronize(WP_CURRENT_CONTEXT);
+
+
+    std::vector<BVHPackedNodeHalf> lowers(bvh.max_nodes), uppers(bvh.max_nodes);
+    wp_memcpy_d2h(WP_CURRENT_CONTEXT, lowers.data(), bvh.node_lowers, bvh.max_nodes * sizeof(BVHPackedNodeHalf));
+    wp_memcpy_d2h(WP_CURRENT_CONTEXT, uppers.data(), bvh.node_uppers, bvh.max_nodes * sizeof(BVHPackedNodeHalf));
+
+    static uint32_t fcount = 0;
+    char filepath[256];
+    snprintf(filepath, std::size(filepath), "D:/tmp/debug_warp_bvh.%04d.obj", fcount++);
+    FILE* f = fopen(filepath, "w");
+
+    uint32_t vert_count = 0;
+#if 1
+    uint32_t max_depth = 0;
+    auto traverse = [f, &lowers, &uppers, &max_depth](const auto& self, uint32_t node_id, uint32_t depth, uint32_t& vert_count) -> void {
+       
+        max_depth = max(max_depth, depth);
+
+        BVHPackedNodeHalf const& lower = lowers[node_id];
+        BVHPackedNodeHalf const& upper = uppers[node_id];
+
+        fprintf(f, "g node_%04d_l_%04d_r_%04d_d_%d%s\n", 
+            node_id, lower.i, upper.i, depth, lower.b ? "_leaf" : "");
+
+        print_verts(f, lower, upper);
+        print_face( f, vert_count );
+        vert_count += 8;
+
+        if( !lower.b )
+        {
+            self( self, lower.i, depth + 1, vert_count );
+            self( self, upper.i, depth + 1, vert_count );
+        }
+    };
+
+    traverse( traverse, root, 1, vert_count );
+    printf("\nXXXX debug : %s root=%d, max_depth=%d max_nodes=%d\n", filepath, root, max_depth, bvh.max_nodes);    
+#else    
+    for( uint32_t i = 0; i < (uint32_t)nodes.size(); ++i )
+    {
+        node_type const& n = nodes[i];        
+        if( n.leaf )
+        {
+            fprintf( f, "g node_%04d_l_%04d_r_%04d_%s\n", 
+                i, n.left_child, n.right_child, n.leaf ? "_leaf" : "" );
+
+            print_verts( f, n.aabb );
+            print_face( f, vert_count );
+
+            vert_count += 8;
+        }
+    }
+#endif
+    fclose( f );
+}
+
+static bounds3 _total_bounds;
+static vec3 _total_inv_edges;
+
+class StopwatchGPU
+{
+public:
+    void StopwatchGPU::start( CUstream stream )
+    {
+        // all but 'stopped' states are valid, so can advance up to 3 times
+        assert( state != State::ticking );
+        cudaEventRecord( *m_startEvent, m_stream = stream );
+        state = State::ticking;
+    }
+
+    void StopwatchGPU::stop()
+    {
+        assert( state == State::ticking );
+        cudaEventRecord( *m_stopEvent, m_stream );
+        state = State::stopped;
+    }
+
+    void StopwatchGPU::sync()
+    {
+        assert( state == State::stopped );
+        cudaEventSynchronize( *m_stopEvent );
+        state = State::synced;
+    }
+
+    std::optional<float> StopwatchGPU::elapsed()
+    {
+        if( state == State::reset )
+            return {};
+
+        assert( state == State::stopped );
+
+        sync();
+
+        state         = State::reset;
+        float elapsed = 0.f;
+        cudaEventElapsedTime( &elapsed, *m_startEvent, *m_stopEvent );
+        return elapsed;
+    }
+
+    std::optional<float> StopwatchGPU::elapsedAsync()
+    {
+        if( state == State::reset )
+            return {};
+
+        // user is responsible for device sync, so we can't track it
+        assert( state != State::ticking );
+
+        state         = State::reset;
+        float elapsed = 0.f;
+        cudaEventElapsedTime( &elapsed, *m_startEvent, *m_stopEvent );
+        return elapsed;
+    }
+
+  private:
+
+    struct Event
+    {
+        CUevent m_event = nullptr;
+        Event::Event()
+        {
+            cudaEventCreate( &m_event );
+        }
+
+        Event::~Event() noexcept
+        {
+            if( m_event )
+                cudaEventDestroy( m_event );
+        }
+
+        Event( Event&& e )
+        {
+            m_event   = e.m_event;
+            e.m_event = nullptr;
+        }
+        Event&  operator=( const Event& event ) = delete;
+        CUevent operator*() { return m_event; }
+    };
+
+    Event m_startEvent;
+    Event m_stopEvent;
+
+    CUstream m_stream = nullptr;
+
+    enum class State : uint8_t
+    {
+        reset = 0,
+        ticking,
+        stopped,
+        synced
+    } state = State::reset;
+};
+
+struct Profiler 
+{
+    enum class Timer : uint8_t {
+        extents = 0,
+        inv_extents,
+        morton_codes,
+        sort_pairs,
+        key_deltas,
+        build_leaves,
+        build_hierarchy,
+        pack_leaves,
+        global,
+        count
+    };
+
+    static constexpr char const* timer_names[] = { 
+        "compute extents", 
+        "compute inverse extents total" ,
+        "compute morton codes",
+        "sort pairs",
+        "compute key deltas",
+        "build leaves",
+        "build hierarchy",
+        "mark packed leaf nodes",
+        "global"
+    };
+
+    static_assert( (uint8_t)Timer::count == std::size(timer_names) );
+
+    std::array<StopwatchGPU, (uint8_t)Timer::count> timers;
+
+    StopwatchGPU& operator [](Timer i) { return timers[(uint8_t)i]; }
+
+    void print_timers(FILE* f = stdout)
+    {
+        cudaDeviceSynchronize();
+        float total = 0.f;
+        for( uint8_t i = 0; i < (uint8_t)Timer::global; ++i )
+        {
+            StopwatchGPU& timer = timers[i];
+            if( auto elapsed = timer.elapsedAsync() )
+            {
+                printf(" - %s : %.2f ms\n", timer_names[i], *elapsed);
+                total += *elapsed;
+            }
+        }
+        printf( " - total : %.2f ms\n", total );
+        
+        if( auto elapsed = timers[(uint8_t)Timer::global].elapsedAsync() )
+            printf( " - %s : %.2f ms\n", timer_names[(uint8_t)Timer::global], *elapsed );
+    }
+} profiler;
 
 void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* item_uppers, int num_items, bounds3* total_bounds)
 {
+    StopwatchGPU timer;
+
     // allocate temporary memory used during  building
     indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*num_items*2); 	// *2 for radix sort
     keys = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*num_items*2);	    // *2 for radix sort
@@ -497,6 +735,12 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
     range_lefts = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh.max_nodes);
     range_rights = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh.max_nodes);
     num_children = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh.max_nodes);
+
+    //if (!_total_bounds.empty())
+    //    total_bounds = &_total_bounds;
+
+     
+    profiler[Profiler::Timer::global].start((CUstream)WP_CURRENT_CONTEXT);
 
     // if total bounds supplied by the host then we just 
     // compute our edge length and upload it to the GPU directly
@@ -506,8 +750,8 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
         vec3 edges = (*total_bounds).edges();
         edges += vec3(0.0001f);
 
-        vec3 inv_edges = vec3(1.0f/edges[0], 1.0f/edges[1], 1.0f/edges[2]);
-        
+        vec3 inv_edges = _total_bounds.empty() ? vec3(1.0f/edges[0], 1.0f/edges[1], 1.0f/edges[2]) : _total_inv_edges;
+
         wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_lower, &total_bounds->lower[0], sizeof(vec3));
         wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_upper, &total_bounds->upper[0], sizeof(vec3));
         wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_inv_edges, &inv_edges[0], sizeof(vec3));
@@ -521,31 +765,180 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
         wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_upper, &upper, sizeof(upper));
 
         // compute the total bounds on the GPU
+        profiler[Profiler::Timer::extents].start((CUstream)WP_CURRENT_CONTEXT);
         wp_launch_device(WP_CURRENT_CONTEXT, compute_total_bounds, num_items, (item_lowers, item_uppers, total_lower, total_upper, num_items));
+        profiler[Profiler::Timer::extents].stop();
 
         // compute the total edge length
+        profiler[Profiler::Timer::inv_extents].start((CUstream)WP_CURRENT_CONTEXT);
         wp_launch_device(WP_CURRENT_CONTEXT, compute_total_inv_edges, 1, (total_lower, total_upper, total_inv_edges));
+        profiler[Profiler::Timer::inv_extents].stop();
+
     }
 
     // assign 30-bit Morton code based on the centroid of each triangle and bounds for each leaf
+    profiler[Profiler::Timer::morton_codes].start((CUstream)WP_CURRENT_CONTEXT);
     wp_launch_device(WP_CURRENT_CONTEXT, compute_morton_codes, num_items, (item_lowers, item_uppers, num_items, total_lower, total_inv_edges, indices, keys));
-    
+    profiler[Profiler::Timer::morton_codes].stop();
+
     // sort items based on Morton key (note the 32-bit sort key corresponds to the template parameter to morton3, i.e. 3x9 bit keys combined)
+
+    profiler[Profiler::Timer::sort_pairs].start((CUstream)WP_CURRENT_CONTEXT);
     radix_sort_pairs_device(WP_CURRENT_CONTEXT, keys, indices, num_items);
     wp_memcpy_d2d(WP_CURRENT_CONTEXT, bvh.primitive_indices, indices, sizeof(int) * num_items);
+    profiler[Profiler::Timer::sort_pairs].stop();
+
+#if 0
+    {
+        wp_cuda_context_synchronize(WP_CURRENT_CONTEXT);
+        vec3 upper(-FLT_MAX), lower(FLT_MAX), inv(FLT_MAX);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, &lower, total_lower, sizeof(vec3));            
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, &upper, total_upper, sizeof(vec3));
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, &inv, total_inv_edges, sizeof(vec3));        
+        wp_cuda_context_synchronize(WP_CURRENT_CONTEXT);
+        FILE* f = fopen("D:/Work/dev/optix/optix_cluster_bench.clean/_build/warp_log", "w");
+        fprintf(f, "AABB (%x %x %x - %x %x %x) inv=(%x %x %x)\n",
+                *(uint32_t const*)&lower[0],
+                *(uint32_t const*)&lower[1], 
+                *(uint32_t const*)&lower[2], 
+                *(uint32_t const*)&upper[0], 
+                *(uint32_t const*)&upper[1], 
+                *(uint32_t const*)&upper[2], 
+                *(uint32_t const*)&inv[0], 
+                *(uint32_t const*)&inv[1], 
+                *(uint32_t const*)&inv[2]);
+
+        std::vector<int> _keys(num_items * 2), _indices(num_items * 2);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _keys.data(), keys, num_items * 2 * sizeof(int));
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _indices.data(), indices, num_items * 2 * sizeof(int));
+        for (uint32_t i = 0; i < (num_items * 2); ++i)
+            printf(f, "key: %d value: %d\n", _keys[i], _indices[i]);
+        fclose(f);
+    }
+#endif    
 
     // calculate deltas between adjacent keys
+    profiler[Profiler::Timer::key_deltas].start((CUstream)WP_CURRENT_CONTEXT);
     wp_launch_device(WP_CURRENT_CONTEXT, compute_key_deltas, num_items, (keys, deltas, num_items-1));
+    profiler[Profiler::Timer::key_deltas].stop();
+
+#if 0
+    {
+        wp_cuda_context_synchronize(WP_CURRENT_CONTEXT);        
+        std::vector<int> _keys(num_items);
+        std::vector<int> _deltas(num_items);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _keys.data(), keys, num_items * sizeof(int));
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _deltas.data(), deltas, num_items * sizeof(int));
+        FILE* f = fopen("D:/Work/dev/optix/optix_cluster_bench.clean/_build/warp_log", "w");
+        for (uint32_t i = 0; i < (num_items); ++i)
+            fprintf(f, "key: %d delta: %d\n", _keys[i], _deltas[i]);
+        fclose(f);
+    }
+#endif    
 
     // initialize leaf nodes
+    profiler[Profiler::Timer::build_leaves].start((CUstream)WP_CURRENT_CONTEXT);
     wp_launch_device(WP_CURRENT_CONTEXT, build_leaves, num_items, (item_lowers, item_uppers, num_items, indices, range_lefts, range_rights, bvh.node_lowers, bvh.node_uppers));
-    
+    profiler[Profiler::Timer::build_leaves].stop();
+
+#if 0
+    {
+        wp_cuda_context_synchronize(WP_CURRENT_CONTEXT);
+        std::vector<wp::BVHPackedNodeHalf> _node_lowers(bvh.max_nodes), _node_uppers(bvh.max_nodes);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _node_lowers.data(), bvh.node_lowers, bvh.max_nodes * sizeof(wp::BVHPackedNodeHalf));
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _node_uppers.data(), bvh.node_uppers, bvh.max_nodes * sizeof(wp::BVHPackedNodeHalf));
+
+        std::vector<int> _range_lefts(bvh.max_nodes), _range_rights(bvh.max_nodes);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _range_lefts.data(), range_lefts, bvh.max_nodes * sizeof(int));
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _range_rights.data(), range_rights, bvh.max_nodes * sizeof(int));
+
+        FILE* f = fopen("D:/Work/dev/optix/optix_cluster_bench.clean/_build/warp_log", "w");
+        for (uint32_t i = 0; i < (bvh.max_nodes); ++i)
+        {
+            wp::BVHPackedNodeHalf const& lo = _node_lowers[i], up = _node_uppers[i];
+            fprintf(f, "(%f %f %f) (%f %f %f) l=%d r=%d b=%d range(%d %d)\n", lo.x, lo.y, lo.z, up.x, up.y, up.z, lo.i, up.i, lo.b, _range_lefts[i], _range_rights[i]);
+        }
+        fclose(f);
+    }
+#endif    
+
     // reset children count, this is our atomic counter so we know when an internal node is complete, only used during building
     wp_memset_device(WP_CURRENT_CONTEXT, num_children, 0, sizeof(int)*bvh.max_nodes);
 
     // build the tree and internal node bounds
+    profiler[Profiler::Timer::build_hierarchy].start((CUstream)WP_CURRENT_CONTEXT);
     wp_launch_device(WP_CURRENT_CONTEXT, build_hierarchy, num_items, (num_items, bvh.root, deltas, num_children, bvh.primitive_indices, range_lefts, range_rights, bvh.node_parents, bvh.node_lowers, bvh.node_uppers));
+    profiler[Profiler::Timer::build_hierarchy].stop();
+
+#if 0
+    {
+        wp_cuda_context_synchronize(WP_CURRENT_CONTEXT);
+        std::vector<wp::BVHPackedNodeHalf> _node_lowers(bvh.max_nodes), _node_uppers(bvh.max_nodes);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _node_lowers.data(), bvh.node_lowers, bvh.max_nodes * sizeof(wp::BVHPackedNodeHalf));
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _node_uppers.data(), bvh.node_uppers, bvh.max_nodes * sizeof(wp::BVHPackedNodeHalf));
+
+        std::vector<int> _parents(bvh.max_nodes);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _parents.data(), bvh.node_parents, bvh.max_nodes * sizeof(int));
+
+        std::vector<int> _num_children(bvh.max_nodes);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _num_children.data(), num_children, bvh.max_nodes * sizeof(int));
+
+        FILE* f = fopen("D:/Work/dev/optix/optix_cluster_bench.clean/_build/warp_log", "w");
+        for (uint32_t i = 0; i < (bvh.max_nodes); ++i)
+        {
+            wp::BVHPackedNodeHalf const& lo = _node_lowers[i], up = _node_uppers[i];
+            fprintf(f, "%d (%f %f %f) (%f %f %f) l=%d r=%d b=%d p=%d cc=%d\n", i, lo.x, lo.y, lo.z, up.x, up.y, up.z, lo.i, up.i, lo.b, _parents[i], _num_children[i]);
+        }
+        fclose(f);
+    }
+#endif         
+    profiler[Profiler::Timer::pack_leaves].start((CUstream)WP_CURRENT_CONTEXT);
     wp_launch_device(WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes, (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, bvh.node_lowers, bvh.node_uppers));
+    profiler[Profiler::Timer::pack_leaves].stop();
+
+    profiler[Profiler::Timer::global].stop();
+
+    profiler.print_timers( stdout );
+
+    //debug(bvh);
+
+#if 0
+    {
+        wp_cuda_context_synchronize(WP_CURRENT_CONTEXT);
+        std::vector<wp::BVHPackedNodeHalf> _node_lowers(bvh.max_nodes), _node_uppers(bvh.max_nodes);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _node_lowers.data(), bvh.node_lowers, bvh.max_nodes * sizeof(wp::BVHPackedNodeHalf));
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _node_uppers.data(), bvh.node_uppers, bvh.max_nodes * sizeof(wp::BVHPackedNodeHalf));
+
+        std::vector<int> _parents(bvh.max_nodes);
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, _parents.data(), bvh.node_parents, bvh.max_nodes * sizeof(int));
+
+        int max_depth = 0, root = -1;
+        for( uint32_t i = 0; i < (uint32_t)bvh.max_nodes; ++i )
+        {
+            int depth = 1;
+            int parent = _parents[i];
+            
+            if( parent == -1 )
+                root = i;
+
+            while (parent != -1)
+            {
+                parent = _parents[parent];
+                depth++;
+            }
+            max_depth = std::max(max_depth, depth);
+        }
+        printf("root=%d max_depth=%d nnodes=%d\n", root, max_depth, bvh.max_nodes);
+
+        FILE* f = fopen("D:/Work/dev/optix/optix_cluster_bench.clean/_build/warp_log", "w");
+        for (uint32_t i = 0; i < (bvh.max_nodes); ++i)
+        {
+            wp::BVHPackedNodeHalf const& lo = _node_lowers[i], up = _node_uppers[i];
+            fprintf(f, "%d (%f %f %f) (%f %f %f) l=%d r=%d b=%d p=%d\n", i, lo.x, lo.y, lo.z, up.x, up.y, up.z, lo.i, up.i, lo.b, _parents[i]);
+        }
+        fclose(f);
+    }
+#endif
 
     // free temporary memory
     wp_free_device(WP_CURRENT_CONTEXT, indices);
@@ -554,8 +947,7 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
 
     wp_free_device(WP_CURRENT_CONTEXT, range_lefts);
     wp_free_device(WP_CURRENT_CONTEXT, range_rights);
-    wp_free_device(WP_CURRENT_CONTEXT, num_children);
-
+    wp_free_device(WP_CURRENT_CONTEXT, num_children);    
 }
 
 // buffer_size is the number of T, not the number of bytes
@@ -776,6 +1168,44 @@ uint64_t wp_bvh_create_device(void* context, wp::vec3* lowers, wp::vec3* uppers,
     return bvh_id;
 }
 
+uint64_t wp_bvh_debug_device(void* context, char const* filepath)
+{
+    ContextGuard guard(context);
+
+    int num_items = 0;
+    std::vector<wp::vec3> lowers_host, uppers_host;
+    wp::vec3 inv;
+    {
+        if(FILE* f = fopen(filepath, "rb"))
+        {
+            fread(&num_items, sizeof(int), 1, f);
+            fread(&wp::_total_bounds, sizeof(wp::bounds3), 1, f);
+            fread(&wp::_total_inv_edges, sizeof(wp::vec3), 1, f);
+
+            lowers_host.resize(num_items);
+            fread(lowers_host.data(), sizeof(wp::vec3), num_items, f);        
+
+            uppers_host.resize(num_items);
+            fread(uppers_host.data(), sizeof(wp::vec3), num_items, f);
+
+            fclose(f);
+            printf("read : '%s' (bounds=%d)\n", filepath, num_items);
+        }
+        else 
+        {
+            printf("cannot read : '%s'\n", filepath);
+            return 0;
+        }
+    }
+
+    wp::vec3* lowers = (wp::vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, num_items * sizeof(wp::vec3));
+    wp_memcpy_h2d(WP_CURRENT_CONTEXT, lowers, lowers_host.data(), sizeof(wp::vec3) * num_items);
+
+    wp::vec3* uppers = (wp::vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, num_items * sizeof(wp::vec3));
+    wp_memcpy_h2d(WP_CURRENT_CONTEXT, uppers, uppers_host.data(), sizeof(wp::vec3) * num_items);
+
+    return wp_bvh_create_device(context, lowers, uppers, num_items, BVH_CONSTRUCTOR_LBVH);
+}
 
 void wp_bvh_destroy_device(uint64_t id)
 {

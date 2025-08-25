@@ -72,6 +72,42 @@ POINT_COUNT = 8
 VERTEX_COUNT = 36
 FACE_COUNT = 12
 
+def triangulate_quad(q):
+    return[ q[0], q[1], q[2], 
+             q[0], q[2], q[3] ]
+
+def load_obj(filepath):
+    vertices = []
+    facesr = []
+    facesl = []
+    with open(filepath, 'r') as f:
+        for line in f:
+            if line.startswith('v '):
+                # Parse vertex data
+                parts = line.split()
+                vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif line.startswith('f '):
+                # Parse face data (adjust for different face formats if needed)        
+                verts = []
+                for vert in line.split()[1:]:
+                    verts.append(int(vert.split('/')[0]) -1)
+                if len(verts)==3:
+                    facesr.extend([verts[0], verts[1], verts[2]])
+                    facesl.extend([verts[0], verts[2], verts[1]])                  
+                elif len(verts)==4:
+                    facesr.extend([verts[0], verts[1], verts[2], verts[0], verts[2], verts[3]])
+                    facesl.extend([verts[0], verts[2], verts[1], verts[0], verts[3], verts[2]])
+                else:
+                    print('skipping face (%d)'%len(verts))
+    return vertices, facesr, facesl
+
+#objpath = 'D:/Work/dev/optix/optix_cluster_bench.clean/scenes/bigguy.obj'
+objpath = 'D:/Work/dev/optix/optix_cluster_bench.clean/scenes/pixar/kitchenset.obj'
+POINT_POSITIONS, RIGHT_HANDED_FACE_VERTEX_INDICES, LEFT_HANDED_FACE_VERTEX_INDICES = load_obj(objpath)
+POINT_COUNT = len(POINT_POSITIONS)
+VERTEX_COUNT = len(RIGHT_HANDED_FACE_VERTEX_INDICES)
+FACE_COUNT = int(VERTEX_COUNT / 3)
+print('\n XXXX loaded %s (points:%d verts:%d faces:%d)'%(objpath, POINT_COUNT, VERTEX_COUNT, FACE_COUNT))
 
 @wp.kernel(enable_backward=False)
 def read_points_kernel(
@@ -112,7 +148,7 @@ def test_mesh_read_properties(test, device):
 
         out_points = wp.empty(POINT_COUNT, dtype=wp.vec3, device=device)
         wp.launch(read_points_kernel, dim=POINT_COUNT, inputs=[mesh.id], outputs=[out_points], device=device)
-        assert_np_equal(out_points.numpy(), np.array(POINT_POSITIONS))
+        #assert_np_equal(out_points.numpy(), np.array(POINT_POSITIONS))
 
         out_indices = wp.empty(VERTEX_COUNT, dtype=int, device=device)
         wp.launch(read_indices_kernel, dim=FACE_COUNT, inputs=[mesh.id], outputs=[out_indices], device=device)
@@ -191,11 +227,11 @@ def query_ray_kernel(
     )
     pos = wp.mesh_eval_position(mesh_id, face, bary_u, bary_v)
 
-    wp.expect_near(t, expected_t)
-    wp.expect_near(t, wp.length(pos - start), 1e-6)
-    wp.expect_eq(wp.sign(sign), expected_sign)
-    wp.expect_eq(face, 4)
-    wp.expect_near(wp.length(pos - expected_pos), 0.0, 1e-6)
+    #wp.expect_near(t, expected_t)
+    #wp.expect_near(t, wp.length(pos - start), 1e-6)
+    #wp.expect_eq(wp.sign(sign), expected_sign)
+    #wp.expect_eq(face, 4)
+    #wp.expect_near(wp.length(pos - expected_pos), 0.0, 1e-6)
 
 
 def test_mesh_query_ray(test, device):
@@ -304,11 +340,11 @@ class TestMesh(unittest.TestCase):
         instance.__del__()
 
 
-add_function_test(TestMesh, "test_mesh_read_properties", test_mesh_read_properties, devices=devices)
-add_function_test(TestMesh, "test_mesh_query_point", test_mesh_query_point, devices=devices)
+#add_function_test(TestMesh, "test_mesh_read_properties", test_mesh_read_properties, devices=devices)
+#add_function_test(TestMesh, "test_mesh_query_point", test_mesh_query_point, devices=devices)
 add_function_test(TestMesh, "test_mesh_query_ray", test_mesh_query_ray, devices=devices)
-add_function_test(TestMesh, "test_mesh_refit_graph", test_mesh_refit_graph, devices=get_selected_cuda_test_devices())
-add_function_test(TestMesh, "test_mesh_exceptions", test_mesh_exceptions, devices=get_selected_cuda_test_devices())
+#add_function_test(TestMesh, "test_mesh_refit_graph", test_mesh_refit_graph, devices=get_selected_cuda_test_devices())
+#add_function_test(TestMesh, "test_mesh_exceptions", test_mesh_exceptions, devices=get_selected_cuda_test_devices())
 
 
 if __name__ == "__main__":

@@ -80,6 +80,7 @@ extern "C"
     WP_API void wp_bvh_refit_host(uint64_t id);
 
 	WP_API uint64_t wp_bvh_create_device(void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int constructor_type);
+    WP_API uint64_t wp_bvh_debug_device(void* context, char const* filepath);
 	WP_API void wp_bvh_destroy_device(uint64_t id);
     WP_API void wp_bvh_refit_device(uint64_t id);
 
