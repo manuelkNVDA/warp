@@ -207,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quick", action="store_true", help="Only generate PTX code")
     parser.set_defaults(quick=False)
 
-    parser.add_argument("-mp", "--multi_process", type=int, default=1, help='Number of concurrent build tasks.')
+    parser.add_argument("-mp", "--multi_process", type=int, default=1, help="Number of concurrent build tasks.")
 
     group_clang_llvm = parser.add_argument_group("Clang/LLVM Options")
     group_clang_llvm.add_argument("--llvm_path", type=str, help="Path to an existing LLVM installation")
@@ -319,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
                 "native/volume_builder.cu",
                 "native/warp.cu",
             ]
-            warp_cu_paths =  [os.path.join(build_path, cu) for cu in cuda_sources]
+            warp_cu_paths = [os.path.join(build_path, cu) for cu in cuda_sources]
 
         if args.libmathdx and args.libmathdx_path is None:
             print("Warning: libmathdx not found, building without MathDx support")

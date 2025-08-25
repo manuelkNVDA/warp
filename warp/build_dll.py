@@ -40,6 +40,7 @@ def machine_architecture() -> str:
         return "aarch64"
     raise RuntimeError(f"Unrecognized machine architecture {machine}")
 
+
 def run_cmd(cmd):
     if verbose_cmd:
         print(cmd)
@@ -353,9 +354,8 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
         if args.fast_math:
             cpp_flags += " /fp:fast"
 
-        futures = []            
+        futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.multi_process) as executor:
-
             with ScopedTimer("build", active=args.verbose):
                 cpp_cmds = []
                 for cpp_path in cpp_paths:
@@ -363,7 +363,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                     linkopts.append(quote(cpp_out))
                     cpp_cmd = f'"{args.host_compiler}" {cpp_flags} -c "{cpp_path}" /Fo"{cpp_out}"'
                     cpp_cmds.append(cpp_cmd)
-                
+
                 if args.multi_process <= 1:
                     for cpp_cmd in cpp_cmds:
                         run_cmd(cpp_cmd)
@@ -389,15 +389,15 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                 )
 
                 if args.libmathdx_path:
-                    linkopts.append(f'nvJitLink_static.lib /LIBPATH:"{args.libmathdx_path}/lib/x64" mathdx_static.lib')                
+                    linkopts.append(f'nvJitLink_static.lib /LIBPATH:"{args.libmathdx_path}/lib/x64" mathdx_static.lib')
 
-                with ScopedTimer("build_cuda", active=args.verbose):        
+                with ScopedTimer("build_cuda", active=args.verbose):
                     if args.multi_process <= 1:
                         for cuda_cmd in cuda_cmds:
                             run_cmd(cuda_cmd)
                     else:
                         futures = [executor.submit(run_cmd, cmd=cuda_cmd) for cuda_cmd in cuda_cmds]
-        
+
         if futures:
             concurrent.futures.wait(futures, return_when=concurrent.futures.ALL_COMPLETED)
 
@@ -439,9 +439,8 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
 
         ld_inputs = []
 
-        futures = []            
+        futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.multi_process) as executor:
-        
             with ScopedTimer("build", active=args.verbose):
                 cpp_cmds = []
                 for cpp_path in cpp_paths:
@@ -449,14 +448,14 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                     ld_inputs.append(quote(cpp_out))
                     cpp_cmd = f'{cpp_compiler} {cpp_flags} -c "{cpp_path}" -o "{cpp_out}"'
                     cpp_cmds.append(cpp_cmd)
-                
+
                 if args.multi_process <= 1:
                     for cpp_cmd in cpp_cmds:
                         run_cmd(cpp_cmd)
                 else:
                     futures = [executor.submit(run_cmd, cmd=cpp_cmd) for cpp_cmd in cpp_cmds]
 
-            if cu_paths:               
+            if cu_paths:
                 cuda_cmds = []
                 for cu_path in cu_paths:
                     cu_out = cu_path + ".o"
@@ -472,7 +471,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                             cuda_cmd = f'clang++ -Werror -Wuninitialized -Wno-unknown-cuda-version {" ".join(clang_opts)} -g -O0 -fPIC -fvisibility=hidden -D_DEBUG -D_ITERATOR_DEBUG_LEVEL=0 -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
                         elif mode == "release":
                             cuda_cmd = f'clang++ -Werror -Wuninitialized -Wno-unknown-cuda-version {" ".join(clang_opts)} -O3 -fPIC -fvisibility=hidden -DNDEBUG -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
-                        
+
                     cuda_cmds.append(cuda_cmd)
 
                     ld_inputs.append(quote(cu_out))
@@ -483,7 +482,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
 
                 if args.libmathdx_path:
                     ld_inputs.append(f"-lnvJitLink_static -L{args.libmathdx_path}/lib -lmathdx_static")
-    
+
                 with ScopedTimer("build_cuda", active=args.verbose):
                     if args.multi_process <= 1:
                         for cuda_cmd in cuda_cmds:
